@@ -20,8 +20,9 @@ from guided_diffusion.script_util import (
 )
 
 
-def main():
-    args = create_argparser().parse_args()
+def main(rank, args):
+    print(f"Rank = {rank}")
+    os.environ["GUIDED_DIFFUSION_RANK"] = str(rank)
 
     dist_util.setup_dist()
     logger.configure()
@@ -51,11 +52,17 @@ def main():
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
+        device = dist_util.dev()
+        th.manual_seed(0)
+
+        noise = th.randn(args.batch_size, 3, args.image_size, args.image_size, device=device)
         sample = sample_fn(
             model,
             (args.batch_size, 3, args.image_size, args.image_size),
             clip_denoised=args.clip_denoised,
             model_kwargs=model_kwargs,
+            noise=noise,
+            progress=True,
         )
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.permute(0, 2, 3, 1)
@@ -79,7 +86,7 @@ def main():
         label_arr = label_arr[: args.num_samples]
     if dist.get_rank() == 0:
         shape_str = "x".join([str(x) for x in arr.shape])
-        out_path = os.path.join(logger.get_dir(), f"samples_{shape_str}.npz")
+        out_path = f"samples/samples_{shape_str}_nsteps_{args.timestep_respacing}.npz"
         logger.log(f"saving to {out_path}")
         if args.class_cond:
             np.savez(out_path, arr, label_arr)
@@ -105,4 +112,16 @@ def create_argparser():
 
 
 if __name__ == "__main__":
-    main()
+    args = create_argparser().parse_args()
+    ndevices = th.cuda.device_count()
+    print(f"Sampling with {ndevices} GPUs")
+    if ndevices > 1:
+        th.multiprocessing.set_start_method('spawn')
+        procs = []
+        for rank in range(ndevices):
+            p = th.multiprocessing.Process(target=main, args=(rank,args))
+            p.start()
+            procs.append(p)
+        [p.join() for p in procs]
+    else:
+        main(0, args)
